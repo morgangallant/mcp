@@ -1,0 +1,11 @@
+[Unit]
+Description=mcp
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5s
+ExecStart=/root/mcp
+
+[Install]
+WantedBy=multi-user.target
