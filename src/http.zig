@@ -107,6 +107,7 @@ pub fn ServerType(
             cpl: union(enum) {
                 reading: xev.Completion,
                 writing: xev.Completion,
+                closing: xev.Completion,
             },
             request: Request,
             responder: ResponseWriter,
@@ -124,11 +125,34 @@ pub fn ServerType(
                 self.scheduleRead(&self.read_buf);
             }
 
-            fn close(self: *Connection) void {
+            fn scheduleClose(self: *Connection) void {
                 logger.debug("closing connection fd={d}", .{self.fd});
-                std.os.closeSocket(self.fd);
-                self.request.reset();
-                self.server.connections.destroy(self);
+                self.cpl = .{
+                    .closing = .{
+                        .op = .{ .close = .{ .fd = self.fd } },
+                        .userdata = self,
+                        .callback = close_cb,
+                    },
+                };
+                self.server.loop.add(&self.cpl.closing);
+            }
+
+            fn close_cb(
+                ud: ?*anyopaque,
+                _: *xev.Loop,
+                _: *xev.Completion,
+                r: xev.Result,
+            ) xev.CallbackAction {
+                const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+                _ = r.close catch |err| {
+                    logger.warn(
+                        "error occured while closing socket fd={d}: {s}",
+                        .{ conn.fd, @errorName(err) },
+                    );
+                };
+                conn.request.reset();
+                conn.server.connections.destroy(conn);
+                return .disarm;
             }
 
             fn scheduleRead(self: *Connection, dst: []u8) void {
@@ -157,7 +181,7 @@ pub fn ServerType(
 
                 var got = r.recv catch |err| switch (err) {
                     error.EOF => {
-                        conn.close();
+                        conn.scheduleClose();
                         return .disarm;
                     },
                     else => {
@@ -165,7 +189,7 @@ pub fn ServerType(
                             "recv() failed, socket fd={d}: {s}",
                             .{ conn.fd, @errorName(err) },
                         );
-                        conn.close();
+                        conn.scheduleClose();
                         return .disarm;
                     },
                 };
@@ -179,7 +203,7 @@ pub fn ServerType(
                         "failed to consume stream on fd={d}: {s}",
                         .{ conn.fd, @errorName(err) },
                     );
-                    conn.close();
+                    conn.scheduleClose();
                     return .disarm;
                 };
                 logger.debug("consumed {d} bytes on fd={d}", .{ consumed, conn.fd });
@@ -201,7 +225,7 @@ pub fn ServerType(
                             "failed to handle request on fd={d}: {s}",
                             .{ conn.fd, @errorName(err) },
                         );
-                        conn.close();
+                        conn.scheduleClose();
                     };
                     return .disarm;
                 }
@@ -299,7 +323,7 @@ pub fn ServerType(
                         "send() failed on socket fd={d}: {s}",
                         .{ conn.fd, @errorName(err) },
                     );
-                    conn.close();
+                    conn.scheduleClose();
                     return .disarm;
                 };
                 conn.responder.sent += wrote;

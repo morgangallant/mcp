@@ -19,6 +19,13 @@ pub fn main() !void {
         _ = gp_alloc.deinit();
     };
 
+    //var tpool = xev.ThreadPool.init(.{});
+    //defer {
+    //    tpool.shutdown();
+    //    tpool.deinit();
+    //}
+
+    //var loop = try xev.Loop.init(.{ .thread_pool = &tpool });
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
