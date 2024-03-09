@@ -18,8 +18,8 @@ pub fn ServerType(
         addr: std.net.Address,
         loop: *xev.Loop,
         socket: std.os.socket_t,
-        accept_cpl: xev.Completion,
-        connections: ConcurrentMemoryPoolType(Connection),
+        c_accept: xev.Completion,
+        connections: std.heap.MemoryPool(Connection),
 
         pub fn init(
             self: *Server,
@@ -34,8 +34,8 @@ pub fn ServerType(
                 .addr = addr,
                 .loop = loop,
                 .socket = undefined, // Initialized below
-                .accept_cpl = undefined, // Initialized below
-                .connections = ConcurrentMemoryPoolType(Connection).init(gpa),
+                .c_accept = undefined, // Initialized below
+                .connections = std.heap.MemoryPool(Connection).init(gpa),
             };
             try self.startListening();
         }
@@ -68,25 +68,27 @@ pub fn ServerType(
             try std.os.bind(self.socket, &self.addr.any, self.addr.getOsSockLen());
             try std.os.listen(self.socket, 32);
 
-            self.accept_cpl = .{
+            self.c_accept = .{
                 .op = .{
                     .accept = .{ .socket = self.socket },
                 },
                 .userdata = self,
-                .callback = accept_cb,
+                .callback = acceptCb,
             };
-            self.loop.add(&self.accept_cpl);
+            self.loop.add(&self.c_accept);
         }
 
-        fn accept_cb(
+        fn acceptCb(
             ud: ?*anyopaque,
-            _: *xev.Loop,
-            _: *xev.Completion,
+            l: *xev.Loop,
+            c: *xev.Completion,
             r: xev.Result,
         ) xev.CallbackAction {
             const server = @as(*Server, @ptrCast(@alignCast(ud.?)));
+            std.debug.assert(l == server.loop);
+            std.debug.assert(c == &server.c_accept);
             const sockfd = r.accept catch |err| {
-                logger.err("accepting incoming connection: {s}", .{@errorName(err)});
+                logger.err("error accepting incoming connection: {s}", .{@errorName(err)});
                 return .rearm;
             };
             const conn = server.connections.create() catch |err| {
@@ -94,156 +96,237 @@ pub fn ServerType(
                 logger.err("failed to allocate connection object: {s}", .{@errorName(err)});
                 return .rearm;
             };
-            conn.init(server, sockfd);
-            logger.debug("accepted new connection (fd={d})", .{sockfd});
+            conn.init(server, sockfd) catch |err| {
+                server.connections.destroy(conn);
+                std.os.closeSocket(sockfd);
+                logger.err("failed to init connection object: {s}", .{@errorName(err)});
+                return .rearm;
+            };
+            logger.into("accepted new connection (fd={d})", .{sockfd});
             return .rearm;
         }
 
         const Connection = struct {
             server: *Server,
             fd: std.os.socket_t,
-            read_buf: [4 << 10]u8 = undefined, // 4KiB is what Go uses
-            read_overlap: usize = 0,
-            cpl: union(enum) {
-                reading: xev.Completion,
-                writing: xev.Completion,
-                closing: xev.Completion,
-            },
-            request: Request,
+            read_buf: [4 << 10]u8, // 4KiB is what Go uses
+            read_overlap: usize,
+            request_queue: FifoType,
+            pending_request: Request,
             responder: ResponseWriter,
 
-            fn init(self: *Connection, server: *Server, connfd: std.os.socket_t) void {
+            c_reading: xev.Completion,
+            c_writing: xev.Completion,
+            c_closing: ?xev.Completion,
+
+            c_writing_wakeup: xev.Completion,
+            writing_wakeup: xev.Async,
+
+            c_reading_wakeup: xev.Completion,
+            reading_wakeup: xev.Async,
+
+            const fifo_length = 3;
+            const FifoType = std.fifo.LinearFifo(Request, .{ .Static = fifo_length });
+
+            fn init(self: *Connection, server: *Server, fd: std.os.socket_t) !void {
                 self.* = .{
                     .server = server,
-                    .fd = connfd,
-                    .cpl = undefined, // Initialized below
-                    .request = undefined, // Initialized below
+                    .fd = fd,
+                    .read_buf = undefined,
+                    .read_overlap = 0,
+                    .request_queue = FifoType.init(),
+                    .pending_request = undefined, // Initialized below
                     .responder = undefined, // Initialized below
-                };
-                self.request.init(server.gpa);
-                self.responder.init(server.gpa);
-                self.scheduleRead(&self.read_buf);
-            }
-
-            fn scheduleClose(self: *Connection) void {
-                logger.debug("closing connection fd={d}", .{self.fd});
-                self.cpl = .{
-                    .closing = .{
-                        .op = .{ .close = .{ .fd = self.fd } },
-                        .userdata = self,
-                        .callback = close_cb,
-                    },
-                };
-                self.server.loop.add(&self.cpl.closing);
-            }
-
-            fn close_cb(
-                ud: ?*anyopaque,
-                _: *xev.Loop,
-                _: *xev.Completion,
-                r: xev.Result,
-            ) xev.CallbackAction {
-                const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
-                _ = r.close catch |err| {
-                    logger.warn(
-                        "error occured while closing socket fd={d}: {s}",
-                        .{ conn.fd, @errorName(err) },
-                    );
-                };
-                conn.request.reset();
-                conn.server.connections.destroy(conn);
-                return .disarm;
-            }
-
-            fn scheduleRead(self: *Connection, dst: []u8) void {
-                self.cpl = .{
-                    .reading = .{
+                    .c_reading = .{
                         .op = .{
                             .recv = .{
-                                .fd = self.fd,
-                                .buffer = .{ .slice = dst },
+                                .fd = fd,
+                                .buffer = .{ .slice = &self.read_buf },
                             },
                         },
                         .userdata = self,
-                        .callback = read_cb,
+                        .callback = readCb,
                     },
+                    .c_writing = undefined, // Not initialized yet
+                    .c_closing = null,
+                    .c_writing_wakeup = undefined,
+                    .writing_wakeup = try xev.Async.init(),
                 };
-                self.server.loop.add(&self.cpl.reading);
+                self.pending_request.init(server.gpa);
+                self.responder.init(server.gpa);
+                self.writing_wakeup.wait(
+                    self.server.loop,
+                    &self.c_writing_wakeup,
+                    Connection,
+                    self,
+                    writingWakeupCb,
+                );
+                self.server.loop.add(&self.c_reading);
             }
 
-            fn read_cb(
+            fn deinit(self: *Connection) void {
+                logger.info("closing connection fd={d}", .{self.fd});
+                self.pending_request.reset();
+                var queued: ?Request = self.request_queue.readItem();
+                while (queued) |*q| {
+                    q.reset();
+                    queued = self.request_queue.readItem();
+                }
+                self.responder.deinit();
+                self.writing_wakeup.deinit();
+                self.server.connections.destroy(self);
+            }
+
+            fn closeCb(
                 ud: ?*anyopaque,
-                _: *xev.Loop,
+                l: *xev.Loop,
                 c: *xev.Completion,
                 r: xev.Result,
             ) xev.CallbackAction {
-                const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
-
-                var got = r.recv catch |err| switch (err) {
-                    error.EOF => {
-                        conn.scheduleClose();
-                        return .disarm;
-                    },
-                    else => {
-                        logger.err(
-                            "recv() failed, socket fd={d}: {s}",
-                            .{ conn.fd, @errorName(err) },
-                        );
-                        conn.scheduleClose();
-                        return .disarm;
-                    },
-                };
-                if (conn.read_overlap > 0) {
-                    got += conn.read_overlap;
-                    conn.read_overlap = 0;
-                }
-
-                const consumed = conn.request.consumeStream(conn.read_buf[0..got]) catch |err| {
-                    logger.err(
-                        "failed to consume stream on fd={d}: {s}",
-                        .{ conn.fd, @errorName(err) },
+                const self = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+                std.debug.assert(l == self.server.loop);
+                std.debug.assert(c == &self.c_closing.?);
+                _ = r.close catch |err| {
+                    logger.warn(
+                        "failed to close socket fd={d}: {s}",
+                        .{ self.fd, @errorName(err) },
                     );
-                    conn.scheduleClose();
+                };
+                self.deinit();
+                return .disarm;
+            }
+
+            fn scheduleClose(self: *Connection) void {
+                if (self.c_closing != null) return;
+                self.c_closing = .{
+                    .op = .{ .close = .{ .fd = self.fd } },
+                    .userdata = self,
+                    .callback = closeCb,
+                };
+                self.server.loop.add(&self.c_closing.?);
+            }
+
+            fn readCb(
+                ud: ?*anyopaque,
+                l: *xev.Loop,
+                c: *xev.Completion,
+                r: xev.Result,
+            ) xev.CallbackAction {
+                const self = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+                std.debug.assert(l == self.server.loop);
+                std.debug.assert(c == &self.c_reading);
+                std.debug.assert(self.request_queue.readableLength() < fifo_length);
+
+                var got = r.recv catch |err| {
+                    if (err != error.EOF) {
+                        logger.err(
+                            "recv() failed on socket fd={d}: {s}",
+                            .{ self.fd, @errorName(err) },
+                        );
+                    }
+                    self.scheduleClose();
                     return .disarm;
                 };
-                logger.debug("consumed {d} bytes on fd={d}", .{ consumed, conn.fd });
+                got += self.read_overlap;
+                self.read_overlap = 0;
+
+                const consumed = self.pending_request.consumeStream(
+                    self.read_buf[0..got],
+                ) catch |err| {
+                    logger.err(
+                        "failed to consume stream on fd={d}: {s}",
+                        .{ self.fd, @errorName(err) },
+                    );
+                    self.scheduleClose();
+                    return .disarm;
+                };
 
                 const remaining = got - consumed;
                 if (remaining > 0) {
-                    std.mem.copyForwards(u8, &conn.read_buf, conn.read_buf[consumed..got]);
-                    conn.read_overlap = remaining;
+                    std.mem.copyForwards(u8, &self.read_buf, self.read_buf[consumed..got]);
+                    self.read_overlap = remaining;
                 }
 
-                logger.debug(
-                    "remaining={d},stage={s}",
-                    .{ remaining, @tagName(conn.request.stage) },
-                );
+                c.op.recv.buffer.slice = self.read_buf[self.read_overlap..];
 
-                if (conn.request.stage == .ready) {
-                    conn.onRequestReady() catch |err| {
-                        logger.err(
-                            "failed to handle request on fd={d}: {s}",
-                            .{ conn.fd, @errorName(err) },
-                        );
-                        conn.scheduleClose();
-                    };
-                    return .disarm;
+                if (self.pending_request.stage == .ready) {
+                    const before = self.request_queue.readableLength();
+                    self.request_queue.writeItem(self.pending_request) catch unreachable;
+                    self.pending_request.init(self.server.gpa);
+                    if (before == 0) {
+                        self.writing_wakeup.notify() catch |err| {
+                            logger.err(
+                                "failed to wakeup writer on fd={d}: {s}",
+                                .{ self.fd, @errorName(err) },
+                            );
+                            self.scheduleClose();
+                            return .disarm;
+                        };
+                    } else if (before == fifo_length - 1) {
+                        return .disarm; // No more space in queue
+                    }
                 }
-
-                c.op.recv.buffer.slice = conn.read_buf[conn.read_overlap..];
 
                 return .rearm;
             }
 
-            fn onRequestReady(self: *Connection) !void {
-                std.debug.assert(self.request.stage == .ready);
-                logger.debug("invoking handler function for fd={d}", .{self.fd});
-                handlerFn(self.server.ctx, &self.responder, &self.request) catch |err| {
+            fn writingWakeupCb(
+                ud: ?*Connection,
+                l: *xev.Loop,
+                c: *xev.Completion,
+                r: xev.Async.WaitError!void,
+            ) xev.CallbackAction {
+                const self = ud.?;
+                std.debug.assert(l == self.server.loop);
+                std.debug.assert(c == &self.c_writing_wakeup);
+
+                _ = r catch |err| {
+                    logger.err(
+                        "got error on writer wakeup (fd={d}): {s}",
+                        .{ self.fd, @errorName(err) },
+                    );
+                    self.scheduleClose();
+                    return .disarm;
+                };
+
+                self.processQueuedRequest() catch |err| {
+                    logger.err(
+                        "failed to process request on fd={d}: {s}",
+                        .{ self.fd, @errorName(err) },
+                    );
+                    self.responder.reset();
+                    return .rearm;
+                };
+
+                self.c_writing = .{
+                    .op = .{
+                        .send = .{
+                            .fd = self.fd,
+                            .buffer = .{ .slice = self.responder.preamble.items },
+                        },
+                    },
+                    .userdata = self,
+                    .callback = writeCb,
+                };
+                self.server.loop.add(&self.c_writing);
+
+                return .rearm;
+            }
+
+            fn processQueuedRequest(self: *Connection) !void {
+                std.debug.assert(self.request_queue.readableLength() > 0);
+
+                var request = self.request_queue.readItem().?;
+                defer request.reset();
+
+                std.debug.assert(request.stage == .ready);
+
+                handlerFn(self.server.ctx, &self.responder, &request) catch |err| {
                     self.responder.status = .internal_server_error;
                     self.responder.body.clearRetainingCapacity();
                     try self.responder.body.appendSlice("an internal server error occured");
                     logger.err(
-                        "request handler on fd={d} returned error {s}",
+                        "request handler failed (fd={d}): {s}",
                         .{ self.fd, @errorName(err) },
                     );
                 };
@@ -259,11 +342,11 @@ pub fn ServerType(
                 try w.writeAll("\r\n");
 
                 if (!self.responder.headers.contains("server")) {
-                    try w.writeAll("Server: lstd\r\n");
+                    try w.writeAll("Server: mcp\r\n");
                 }
 
                 if (!self.responder.headers.contains("connection")) {
-                    const req_connection = self.request.headers.getFirstValue("connection");
+                    const req_connection = self.pending_request.headers.getFirstValue("connection");
                     const req_keepalive = req_connection != null and
                         !std.ascii.eqlIgnoreCase("close", req_connection.?);
                     if (req_keepalive) {
@@ -285,62 +368,92 @@ pub fn ServerType(
 
                 try w.writeAll("\r\n");
 
-                if (self.request.method == .HEAD) {
+                if (self.pending_request.method == .HEAD) {
                     self.responder.body.clearAndFree();
                 }
-
-                self.request.reset();
-
-                self.scheduleWrite();
             }
 
-            fn scheduleWrite(self: *Connection) void {
-                self.cpl = .{
-                    .writing = .{
-                        .op = .{
-                            .send = .{
-                                .fd = self.fd,
-                                .buffer = .{ .slice = self.responder.preamble.items },
-                            },
-                        },
-                        .userdata = self,
-                        .callback = write_cb,
-                    },
-                };
-                self.server.loop.add(&self.cpl.writing);
-            }
-
-            fn write_cb(
+            fn writeCb(
                 ud: ?*anyopaque,
-                _: *xev.Loop,
+                l: *xev.Loop,
                 c: *xev.Completion,
                 r: xev.Result,
             ) xev.CallbackAction {
-                const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+                const self = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+                std.debug.assert(l == self.server.loop);
+                std.debug.assert(c == &self.c_writing);
 
                 const wrote = r.send catch |err| {
                     logger.err(
                         "send() failed on socket fd={d}: {s}",
-                        .{ conn.fd, @errorName(err) },
+                        .{ self.fd, @errorName(err) },
                     );
-                    conn.scheduleClose();
+                    self.scheduleClose();
                     return .disarm;
                 };
-                conn.responder.sent += wrote;
+                self.responder.sent += wrote;
 
-                const preamble_len = conn.responder.preamble.items.len;
-                const body_len = conn.responder.body.items.len;
-                if (conn.responder.sent < preamble_len) {
-                    c.op.send.buffer.slice = conn.responder.preamble.items[conn.responder.sent..];
-                    return .rearm;
-                } else if (conn.responder.sent < preamble_len + body_len) {
-                    const offset = conn.responder.sent - preamble_len;
-                    c.op.send.buffer.slice = conn.responder.body.items[offset..];
-                    return .rearm;
+                const preamble_len = self.responder.preamble.items.len;
+                const body_len = self.responder.body.items.len;
+                if (self.responder.sent < preamble_len) {
+                    self.c_writing = .{
+                        .op = .{
+                            .send = .{
+                                .fd = self.fd,
+                                .buffer = .{
+                                    .slice = self.responder.preamble.items[self.responder.sent..],
+                                },
+                            },
+                        },
+                        .userdata = self,
+                        .callback = writeCb,
+                    };
+                    self.server.loop.add(&self.c_writing);
+                    return .disarm;
+                } else if (self.responder.sent < preamble_len + body_len) {
+                    const offset = self.responder.sent - preamble_len;
+                    self.c_writing = .{
+                        .op = .{
+                            .send = .{
+                                .fd = self.fd,
+                                .buffer = .{
+                                    .slice = self.responder.body.items[offset..],
+                                },
+                            },
+                        },
+                        .userdata = self,
+                        .callback = writeCb,
+                    };
+                    self.server.loop.add(&self.c_writing);
+                    return .disarm;
                 }
-                std.debug.assert(conn.responder.sent == preamble_len + body_len);
-                conn.responder.reset();
-                conn.scheduleRead(conn.read_buf[conn.read_overlap..]);
+                std.debug.assert(self.responder.sent == preamble_len + body_len);
+
+                while (self.request_queue.readableLength() > 0) {
+                    self.responder.reset();
+                    self.processQueuedRequest() catch |err| {
+                        logger.err(
+                            "failed to process request on fd={d}: {s}",
+                            .{ self.fd, @errorName(err) },
+                        );
+                        continue;
+                    };
+                    self.c_writing = .{
+                        .op = .{
+                            .send = .{
+                                .fd = self.fd,
+                                .buffer = .{
+                                    .slice = self.responder.preamble.items,
+                                },
+                            },
+                        },
+                        .userdata = self,
+                        .callback = writeCb,
+                    };
+                    self.server.loop.add(&self.c_writing);
+                    return .disarm;
+                }
+
                 return .disarm;
             }
         };
