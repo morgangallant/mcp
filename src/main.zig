@@ -41,6 +41,6 @@ pub fn main() !void {
 const errType = error{OutOfMemory};
 
 fn handlerFn(_: void, rw: *http.ResponseWriter, _: *const http.Request) errType!void {
-    rw.status = .ok;
-    try rw.body.appendSlice("End of line.");
+    rw.setStatus(.ok);
+    try rw.body.writer().writeAll("End of line.");
 }

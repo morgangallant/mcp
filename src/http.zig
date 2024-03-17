@@ -41,7 +41,7 @@ pub fn ServerType(
         }
 
         pub fn deinit(self: *Server) void {
-            std.os.closeSocket(self.socket);
+            std.os.close(self.socket);
             self.connections.deinit();
             self.* = undefined;
         }
@@ -58,7 +58,7 @@ pub fn ServerType(
                 flags,
                 std.os.IPPROTO.TCP,
             );
-            errdefer std.os.closeSocket(self.socket);
+            errdefer std.os.close(self.socket);
             try std.os.setsockopt(
                 self.socket,
                 std.os.SOL.SOCKET,
@@ -92,17 +92,12 @@ pub fn ServerType(
                 return .rearm;
             };
             const conn = server.connections.create() catch |err| {
-                std.os.closeSocket(sockfd);
+                std.os.close(sockfd);
                 logger.err("failed to allocate connection object: {s}", .{@errorName(err)});
                 return .rearm;
             };
-            conn.init(server, sockfd) catch |err| {
-                server.connections.destroy(conn);
-                std.os.closeSocket(sockfd);
-                logger.err("failed to init connection object: {s}", .{@errorName(err)});
-                return .rearm;
-            };
-            logger.into("accepted new connection (fd={d})", .{sockfd});
+            conn.init(server, sockfd);
+            logger.info("accepted new connection (fd={d})", .{sockfd});
             return .rearm;
         }
 
@@ -111,81 +106,106 @@ pub fn ServerType(
             fd: std.os.socket_t,
             read_buf: [4 << 10]u8, // 4KiB is what Go uses
             read_overlap: usize,
-            request_queue: FifoType,
             pending_request: Request,
             responder: ResponseWriter,
+            closing: bool,
+            cmpl: xev.Completion,
 
-            c_reading: xev.Completion,
-            c_writing: xev.Completion,
-            c_closing: ?xev.Completion,
-
-            c_writing_wakeup: xev.Completion,
-            writing_wakeup: xev.Async,
-
-            c_reading_wakeup: xev.Completion,
-            reading_wakeup: xev.Async,
-
-            const fifo_length = 3;
-            const FifoType = std.fifo.LinearFifo(Request, .{ .Static = fifo_length });
-
-            fn init(self: *Connection, server: *Server, fd: std.os.socket_t) !void {
+            fn init(self: *Connection, server: *Server, connfd: std.os.socket_t) void {
                 self.* = .{
                     .server = server,
-                    .fd = fd,
+                    .fd = connfd,
                     .read_buf = undefined,
                     .read_overlap = 0,
-                    .request_queue = FifoType.init(),
                     .pending_request = undefined, // Initialized below
                     .responder = undefined, // Initialized below
-                    .c_reading = .{
-                        .op = .{
-                            .recv = .{
-                                .fd = fd,
-                                .buffer = .{ .slice = &self.read_buf },
-                            },
-                        },
-                        .userdata = self,
-                        .callback = readCb,
-                    },
-                    .c_writing = undefined, // Not initialized yet
-                    .c_closing = null,
-                    .c_writing_wakeup = undefined,
-                    .writing_wakeup = try xev.Async.init(),
+                    .closing = false,
+                    .cmpl = undefined, // Initialized by `scheduleNextCompletion`
                 };
                 self.pending_request.init(server.gpa);
                 self.responder.init(server.gpa);
-                self.writing_wakeup.wait(
-                    self.server.loop,
-                    &self.c_writing_wakeup,
-                    Connection,
-                    self,
-                    writingWakeupCb,
-                );
-                self.server.loop.add(&self.c_reading);
+                self.scheduleNextCompletion();
             }
 
             fn deinit(self: *Connection) void {
+                std.debug.assert(self.closing);
                 logger.info("closing connection fd={d}", .{self.fd});
-                self.pending_request.reset();
-                var queued: ?Request = self.request_queue.readItem();
-                while (queued) |*q| {
-                    q.reset();
-                    queued = self.request_queue.readItem();
-                }
+                self.pending_request.deinit();
                 self.responder.deinit();
-                self.writing_wakeup.deinit();
                 self.server.connections.destroy(self);
             }
 
-            fn closeCb(
+            fn scheduleNextCompletion(self: *Connection) void {
+                if (self.closing) {
+                    self.cmpl = .{
+                        .op = .{ .close = .{ .fd = self.fd } },
+                        .userdata = self,
+                        .callback = closeCallback,
+                    };
+                } else if (self.pending_request.stage == .ready) {
+                    const sent = self.responder.sent_bytes;
+                    const preamble_len = self.responder.preamble.items.len;
+                    const body_len = self.responder.body.items.len;
+                    if (sent < preamble_len) {
+                        const slice = self.responder.preamble.items[sent..];
+                        self.cmpl = .{
+                            .op = .{
+                                .send = .{
+                                    .fd = self.fd,
+                                    .buffer = .{
+                                        .slice = slice,
+                                    },
+                                },
+                            },
+                            .userdata = self,
+                            .callback = writeCallback,
+                        };
+                    } else if (sent < preamble_len + body_len) {
+                        const offset = sent - preamble_len;
+                        const slice = self.responder.body.items[offset..];
+                        self.cmpl = .{
+                            .op = .{
+                                .send = .{
+                                    .fd = self.fd,
+                                    .buffer = .{ .slice = slice },
+                                },
+                            },
+                            .userdata = self,
+                            .callback = writeCallback,
+                        };
+                    } else {
+                        std.debug.assert(sent == preamble_len + body_len);
+                        if (!self.pending_request.head.keep_alive) {
+                            self.closing = true;
+                        }
+                        self.pending_request.reset();
+                        self.responder.reset();
+                        self.scheduleNextCompletion();
+                        return;
+                    }
+                } else {
+                    const buf = self.read_buf[self.read_overlap..];
+                    self.cmpl = .{
+                        .op = .{
+                            .recv = .{
+                                .fd = self.fd,
+                                .buffer = .{ .slice = buf },
+                            },
+                        },
+                        .userdata = self,
+                        .callback = readCallback,
+                    };
+                }
+                self.server.loop.add(&self.cmpl);
+            }
+
+            fn closeCallback(
                 ud: ?*anyopaque,
-                l: *xev.Loop,
-                c: *xev.Completion,
+                _: *xev.Loop,
+                _: *xev.Completion,
                 r: xev.Result,
             ) xev.CallbackAction {
                 const self = @as(*Connection, @ptrCast(@alignCast(ud.?)));
-                std.debug.assert(l == self.server.loop);
-                std.debug.assert(c == &self.c_closing.?);
                 _ = r.close catch |err| {
                     logger.warn(
                         "failed to close socket fd={d}: {s}",
@@ -196,26 +216,14 @@ pub fn ServerType(
                 return .disarm;
             }
 
-            fn scheduleClose(self: *Connection) void {
-                if (self.c_closing != null) return;
-                self.c_closing = .{
-                    .op = .{ .close = .{ .fd = self.fd } },
-                    .userdata = self,
-                    .callback = closeCb,
-                };
-                self.server.loop.add(&self.c_closing.?);
-            }
-
-            fn readCb(
+            fn readCallback(
                 ud: ?*anyopaque,
-                l: *xev.Loop,
-                c: *xev.Completion,
+                _: *xev.Loop,
+                _: *xev.Completion,
                 r: xev.Result,
             ) xev.CallbackAction {
                 const self = @as(*Connection, @ptrCast(@alignCast(ud.?)));
-                std.debug.assert(l == self.server.loop);
-                std.debug.assert(c == &self.c_reading);
-                std.debug.assert(self.request_queue.readableLength() < fifo_length);
+                defer self.scheduleNextCompletion();
 
                 var got = r.recv catch |err| {
                     if (err != error.EOF) {
@@ -224,20 +232,18 @@ pub fn ServerType(
                             .{ self.fd, @errorName(err) },
                         );
                     }
-                    self.scheduleClose();
+                    self.closing = true;
                     return .disarm;
                 };
                 got += self.read_overlap;
                 self.read_overlap = 0;
 
-                const consumed = self.pending_request.consumeStream(
-                    self.read_buf[0..got],
-                ) catch |err| {
+                const consumed = self.pending_request.consume(self.read_buf[0..got]) catch |err| {
                     logger.err(
                         "failed to consume stream on fd={d}: {s}",
                         .{ self.fd, @errorName(err) },
                     );
-                    self.scheduleClose();
+                    self.closing = true;
                     return .disarm;
                 };
 
@@ -247,212 +253,53 @@ pub fn ServerType(
                     self.read_overlap = remaining;
                 }
 
-                c.op.recv.buffer.slice = self.read_buf[self.read_overlap..];
-
                 if (self.pending_request.stage == .ready) {
-                    const before = self.request_queue.readableLength();
-                    self.request_queue.writeItem(self.pending_request) catch unreachable;
-                    self.pending_request.init(self.server.gpa);
-                    if (before == 0) {
-                        self.writing_wakeup.notify() catch |err| {
-                            logger.err(
-                                "failed to wakeup writer on fd={d}: {s}",
-                                .{ self.fd, @errorName(err) },
-                            );
-                            self.scheduleClose();
-                            return .disarm;
-                        };
-                    } else if (before == fifo_length - 1) {
-                        return .disarm; // No more space in queue
-                    }
+                    self.processReadyRequest() catch |err| {
+                        logger.err(
+                            "failed to process request on fd={d}: {s}",
+                            .{ self.fd, @errorName(err) },
+                        );
+                        self.closing = true;
+                    };
                 }
 
-                return .rearm;
+                return .disarm;
             }
 
-            fn writingWakeupCb(
-                ud: ?*Connection,
-                l: *xev.Loop,
-                c: *xev.Completion,
-                r: xev.Async.WaitError!void,
-            ) xev.CallbackAction {
-                const self = ud.?;
-                std.debug.assert(l == self.server.loop);
-                std.debug.assert(c == &self.c_writing_wakeup);
+            fn processReadyRequest(self: *Connection) !void {
+                std.debug.assert(self.pending_request.stage == .ready);
 
-                _ = r catch |err| {
-                    logger.err(
-                        "got error on writer wakeup (fd={d}): {s}",
-                        .{ self.fd, @errorName(err) },
-                    );
-                    self.scheduleClose();
-                    return .disarm;
-                };
-
-                self.processQueuedRequest() catch |err| {
-                    logger.err(
-                        "failed to process request on fd={d}: {s}",
-                        .{ self.fd, @errorName(err) },
-                    );
-                    self.responder.reset();
-                    return .rearm;
-                };
-
-                self.c_writing = .{
-                    .op = .{
-                        .send = .{
-                            .fd = self.fd,
-                            .buffer = .{ .slice = self.responder.preamble.items },
-                        },
-                    },
-                    .userdata = self,
-                    .callback = writeCb,
-                };
-                self.server.loop.add(&self.c_writing);
-
-                return .rearm;
-            }
-
-            fn processQueuedRequest(self: *Connection) !void {
-                std.debug.assert(self.request_queue.readableLength() > 0);
-
-                var request = self.request_queue.readItem().?;
-                defer request.reset();
-
-                std.debug.assert(request.stage == .ready);
-
-                handlerFn(self.server.ctx, &self.responder, &request) catch |err| {
-                    self.responder.status = .internal_server_error;
-                    self.responder.body.clearRetainingCapacity();
-                    try self.responder.body.appendSlice("an internal server error occured");
+                handlerFn(self.server.ctx, &self.responder, &self.pending_request) catch |err| {
+                    self.responder.setStatus(.internal_server_error);
+                    self.responder.body.clearAndFree();
+                    try self.responder.writer().writeAll("an internal server error occured");
                     logger.err(
                         "request handler failed (fd={d}): {s}",
                         .{ self.fd, @errorName(err) },
                     );
                 };
 
-                const w = self.responder.preamble.writer();
-
-                const version: std.http.Version = .@"HTTP/1.1";
-                try w.writeAll(@tagName(version));
-                try w.print(" {d} ", .{@intFromEnum(self.responder.status)});
-                if (self.responder.status.phrase()) |phrase| {
-                    try w.writeAll(phrase);
-                }
-                try w.writeAll("\r\n");
-
-                if (!self.responder.headers.contains("server")) {
-                    try w.writeAll("Server: mcp\r\n");
-                }
-
-                if (!self.responder.headers.contains("connection")) {
-                    const req_connection = self.pending_request.headers.getFirstValue("connection");
-                    const req_keepalive = req_connection != null and
-                        !std.ascii.eqlIgnoreCase("close", req_connection.?);
-                    if (req_keepalive) {
-                        try w.writeAll("Connection: keep-alive\r\n");
-                    } else {
-                        try w.writeAll("Connection: close\r\n");
-                    }
-                }
-
-                if (self.responder.headers.getFirstValue("content-length")) |cl| {
-                    const parsed = try std.fmt.parseInt(usize, cl, 10);
-                    std.debug.assert(parsed == self.responder.body.items.len);
-                } else {
-                    const length = self.responder.body.items.len;
-                    if (length > 0) try w.print("Content-Length: {d}\r\n", .{length});
-                }
-
-                try w.print("{}", .{self.responder.headers});
-
-                try w.writeAll("\r\n");
-
-                if (self.pending_request.method == .HEAD) {
-                    self.responder.body.clearAndFree();
-                }
+                try self.responder.finalize(&self.pending_request);
             }
 
-            fn writeCb(
+            fn writeCallback(
                 ud: ?*anyopaque,
-                l: *xev.Loop,
-                c: *xev.Completion,
+                _: *xev.Loop,
+                _: *xev.Completion,
                 r: xev.Result,
             ) xev.CallbackAction {
                 const self = @as(*Connection, @ptrCast(@alignCast(ud.?)));
-                std.debug.assert(l == self.server.loop);
-                std.debug.assert(c == &self.c_writing);
+                defer self.scheduleNextCompletion();
 
                 const wrote = r.send catch |err| {
                     logger.err(
                         "send() failed on socket fd={d}: {s}",
                         .{ self.fd, @errorName(err) },
                     );
-                    self.scheduleClose();
+                    self.closing = true;
                     return .disarm;
                 };
-                self.responder.sent += wrote;
-
-                const preamble_len = self.responder.preamble.items.len;
-                const body_len = self.responder.body.items.len;
-                if (self.responder.sent < preamble_len) {
-                    self.c_writing = .{
-                        .op = .{
-                            .send = .{
-                                .fd = self.fd,
-                                .buffer = .{
-                                    .slice = self.responder.preamble.items[self.responder.sent..],
-                                },
-                            },
-                        },
-                        .userdata = self,
-                        .callback = writeCb,
-                    };
-                    self.server.loop.add(&self.c_writing);
-                    return .disarm;
-                } else if (self.responder.sent < preamble_len + body_len) {
-                    const offset = self.responder.sent - preamble_len;
-                    self.c_writing = .{
-                        .op = .{
-                            .send = .{
-                                .fd = self.fd,
-                                .buffer = .{
-                                    .slice = self.responder.body.items[offset..],
-                                },
-                            },
-                        },
-                        .userdata = self,
-                        .callback = writeCb,
-                    };
-                    self.server.loop.add(&self.c_writing);
-                    return .disarm;
-                }
-                std.debug.assert(self.responder.sent == preamble_len + body_len);
-
-                while (self.request_queue.readableLength() > 0) {
-                    self.responder.reset();
-                    self.processQueuedRequest() catch |err| {
-                        logger.err(
-                            "failed to process request on fd={d}: {s}",
-                            .{ self.fd, @errorName(err) },
-                        );
-                        continue;
-                    };
-                    self.c_writing = .{
-                        .op = .{
-                            .send = .{
-                                .fd = self.fd,
-                                .buffer = .{
-                                    .slice = self.responder.preamble.items,
-                                },
-                            },
-                        },
-                        .userdata = self,
-                        .callback = writeCb,
-                    };
-                    self.server.loop.add(&self.c_writing);
-                    return .disarm;
-                }
+                self.responder.sent_bytes += wrote;
 
                 return .disarm;
             }
@@ -461,10 +308,31 @@ pub fn ServerType(
 }
 
 pub const Request = struct {
-    head: std.http.Request.Head,
+    head: std.http.Server.Request.Head,
     stage: enum { head, body, ready },
     read_buffer: std.ArrayList(u8),
     headers_end: usize,
+
+    fn init(self: *Request, alloc: std.mem.Allocator) void {
+        self.* = .{
+            .head = undefined, // Set in `consume`
+            .stage = .head,
+            .read_buffer = std.ArrayList(u8).init(alloc),
+            .headers_end = undefined, // Set once stage reaches body
+        };
+    }
+
+    fn deinit(self: *Request) void {
+        self.read_buffer.deinit();
+        self.* = undefined;
+    }
+
+    fn reset(self: *Request) void {
+        self.head = undefined;
+        self.stage = .head;
+        self.read_buffer.clearRetainingCapacity();
+        self.headers_end = undefined;
+    }
 
     pub fn consume(self: *Request, stream: []const u8) !usize {
         var consumed: usize = 0;
@@ -472,7 +340,7 @@ pub const Request = struct {
             switch (self.stage) {
                 .ready => break :outer,
                 .body => {
-                    const remaining = if (self.content_length) |cl|
+                    const remaining = if (self.head.content_length) |cl|
                         cl - self.body().len
                     else
                         0;
@@ -491,8 +359,11 @@ pub const Request = struct {
                     } else remaining.len;
                     try self.read_buffer.appendSlice(remaining[0..take]);
                     if (self.stage == .body) {
-                        self.head = try std.http.Request.Head.parse(&self.read_buffer.items);
+                        self.head = try std.http.Server.Request.Head.parse(self.read_buffer.items);
                         self.headers_end = self.read_buffer.items.len;
+                        if ((self.head.content_length orelse 0) == 0) {
+                            self.stage = .ready;
+                        }
                     }
                     consumed += take;
                 },
@@ -507,8 +378,87 @@ pub const Request = struct {
 
     pub fn body(self: *const Request) []const u8 {
         std.debug.assert(self.stage != .head);
-        return self.read_buffer[self.headers_end..];
+        return self.read_buffer.items[self.headers_end..];
     }
 };
 
-const ResponseWriter = struct {};
+pub const ResponseWriter = struct {
+    options: std.http.Server.Request.RespondOptions,
+    preamble: std.ArrayList(u8),
+    body: std.ArrayList(u8),
+    sent_bytes: usize,
+
+    fn init(self: *ResponseWriter, alloc: std.mem.Allocator) void {
+        self.* = .{
+            .options = .{},
+            .preamble = std.ArrayList(u8).init(alloc),
+            .body = std.ArrayList(u8).init(alloc),
+            .sent_bytes = 0,
+        };
+    }
+
+    fn deinit(self: *ResponseWriter) void {
+        self.preamble.deinit();
+        self.body.deinit();
+        self.* = undefined;
+    }
+
+    fn reset(self: *ResponseWriter) void {
+        self.preamble.clearRetainingCapacity();
+        self.body.clearAndFree();
+        self.sent_bytes = 0;
+    }
+
+    fn finalize(self: *ResponseWriter, request: *const Request) !void {
+        std.debug.assert(self.preamble.items.len == 0);
+        const w = self.preamble.writer();
+
+        try w.print(
+            "{s} {d} {s}\r\n",
+            .{
+                @tagName(self.options.version),
+                @intFromEnum(self.options.status),
+                self.options.reason orelse self.options.status.phrase() orelse "",
+            },
+        );
+
+        switch (self.options.version) {
+            .@"HTTP/1.0" => if (request.head.keep_alive) try w.writeAll("connection: keep-alive\r\n"),
+            .@"HTTP/1.1" => if (!request.head.keep_alive) try w.writeAll("connection: close\r\n"),
+        }
+
+        if (self.options.transfer_encoding) |transfer_encoding| switch (transfer_encoding) {
+            .none => {},
+            .chunked => try w.writeAll("transfer-encoding: chunked\r\n"),
+        } else {
+            try w.print("content-length: {d}\r\n", .{self.body.items.len});
+        }
+
+        var server_header = false;
+        for (self.options.extra_headers) |header| {
+            try w.print("{s}: {s}\r\n", .{ header.name, header.value });
+            if (std.ascii.eqlIgnoreCase(header.name, "server")) {
+                server_header = true;
+            }
+        }
+        if (!server_header) {
+            try w.writeAll("server: mcp\r\n");
+        }
+        try w.writeAll("\r\n");
+
+        if (request.head.method == .HEAD) {
+            self.body.clearAndFree();
+        }
+    }
+
+    pub fn setStatus(self: *ResponseWriter, status: std.http.Status) void {
+        self.options.status = status;
+        if (status.phrase()) |phrase| {
+            self.options.reason = phrase;
+        }
+    }
+
+    pub fn writer(self: *ResponseWriter) std.ArrayList(u8).Writer {
+        return self.body.writer();
+    }
+};
