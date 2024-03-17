@@ -488,7 +488,7 @@ pub const Request = struct {
                     const take = if (std.mem.indexOf(u8, remaining, "\r\n\r\n")) |stop| blk: {
                         self.stage = .body;
                         break :blk stop + 4;
-                    } else stream.len;
+                    } else remaining.len;
                     try self.read_buffer.appendSlice(remaining[0..take]);
                     if (self.stage == .body) {
                         self.head = try std.http.Request.Head.parse(&self.read_buffer.items);
