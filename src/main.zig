@@ -19,7 +19,9 @@ pub fn main() !void {
         _ = gp_alloc.deinit();
     };
 
-    var loop = try xev.Loop.init(.{});
+    var loop = try xev.Loop.init(.{
+        .entries = std.math.pow(u13, 2, 12),
+    });
     defer loop.deinit();
 
     var port: u16 = 8080;
