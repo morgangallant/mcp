@@ -24,7 +24,7 @@ pub fn main() !void {
     });
     defer loop.deinit();
 
-    var port: u16 = 8080;
+    var port: u16 = 11106;
     if (std.os.getenv("PORT")) |ps| {
         port = try std.fmt.parseInt(u16, ps, 10);
     }
